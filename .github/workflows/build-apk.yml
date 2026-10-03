@@ -1,0 +1,180 @@
+name: Build Android APK
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android project
+        run: flutter create --platforms=android .
+        
+      - name: Configure native repeating alarm
+        run: python3 configure_alarm_v14.py
+
+      - name: Configure scheduled notification receivers
+        run: |
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          if not manifest.exists():
+              raise SystemExit("AndroidManifest.xml not found after flutter create")
+          text = manifest.read_text()
+          permissions = [
+              '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>',
+              '    <uses-permission android:name="android.permission.VIBRATE"/>',
+              '    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED"/>',
+              '    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM"/>',
+              '    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT"/>',
+          ]
+          for item in permissions:
+              permission_name = item.split('android:name="')[1].split('"')[0]
+              if permission_name not in text:
+                  text = text.replace('<application', item + '\n    <application', 1)
+          receivers = """
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver" />
+              <receiver android:exported="false" android:name="com.dexterous.flutterlocalnotifications.ScheduledNotificationBootReceiver">
+                  <intent-filter>
+                      <action android:name="android.intent.action.BOOT_COMPLETED"/>
+                      <action android:name="android.intent.action.MY_PACKAGE_REPLACED"/>
+                      <action android:name="android.intent.action.QUICKBOOT_POWERON"/>
+                      <action android:name="com.htc.intent.action.QUICKBOOT_POWERON"/>
+                  </intent-filter>
+              </receiver>
+          """
+          if 'com.dexterous.flutterlocalnotifications.ScheduledNotificationReceiver' not in text:
+              text = text.replace('</application>', receivers + '\n        </application>', 1)
+          manifest.write_text(text)
+          print("Scheduled notification receivers configured")
+          PYCODE
+
+      - name: Set Android compile SDK
+        run: |
+          if [ -f android/app/build.gradle.kts ]; then
+            sed -i 's/compileSdk = flutter.compileSdkVersion/compileSdk = 36/' android/app/build.gradle.kts
+          elif [ -f android/app/build.gradle ]; then
+            sed -i 's/compileSdkVersion flutter.compileSdkVersion/compileSdkVersion 36/' android/app/build.gradle
+          fi
+          
+      
+      - name: Enable Android core library desugaring
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          kts = Path("android/app/build.gradle.kts")
+          groovy = Path("android/app/build.gradle")
+
+          path = kts if kts.exists() else groovy
+          if not path.exists():
+              raise SystemExit("Gradle app file not found")
+
+          text = path.read_text()
+          is_kts = path.suffix == ".kts"
+
+          text = re.sub(
+              r"^\s*(?:isCoreLibraryDesugaringEnabled\s*=\s*true|coreLibraryDesugaringEnabled\s+true|coreLibraryDesugaring\s*\(?['\"].*desugar_jdk_libs.*)$\n?",
+              "",
+              text,
+              flags=re.MULTILINE,
+          )
+
+          compile_line = re.search(r"(?m)^(\s*)compileOptions\s*\{", text)
+          if not compile_line:
+              raise SystemExit("compileOptions block not found")
+
+          indent = compile_line.group(1) + "    "
+          enable_line = (
+              indent + "isCoreLibraryDesugaringEnabled = true\n"
+              if is_kts
+              else indent + "coreLibraryDesugaringEnabled true\n"
+          )
+          pos = compile_line.end()
+          text = text[:pos] + "\n" + enable_line + text[pos:]
+
+          dependency = (
+              '    coreLibraryDesugaring("com.android.tools:desugar_jdk_libs:2.1.4")'
+              if is_kts
+              else "    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.4'"
+          )
+
+          dep_block = re.search(r"(?m)^dependencies\s*\{", text)
+          if dep_block:
+              pos = dep_block.end()
+              text = text[:pos] + "\n" + dependency + text[pos:]
+          else:
+              text += "\ndependencies {\n" + dependency + "\n}\n"
+
+          path.write_text(text)
+          print("Desugaring configured in", path)
+          PY
+
+
+      - name: Install dependencies
+        run: flutter pub get
+      
+      
+      - name: Generate app launcher icon
+        run: dart run flutter_launcher_icons
+
+      - name: Fix file_picker compile SDK
+        run: |
+          FILE_PICKER_GRADLE=$(find "$HOME/.pub-cache/hosted/pub.dev" -mindepth 3 -maxdepth 3 -type f \( -name "build.gradle" -o -name "build.gradle.kts" \) -path "*/file_picker-*/android/*" -print -quit)
+
+          if [ -z "$FILE_PICKER_GRADLE" ]; then
+            echo "Main file_picker Gradle file not found"
+            exit 1
+          fi
+
+          echo "Fixing main plugin: $FILE_PICKER_GRADLE"
+
+          sed -i -E 's/compileSdkVersion[[:space:]]+.*/compileSdkVersion 36/; s/compileSdk[[:space:]]*=[[:space:]]*.*/compileSdk = 36/; s/compileSdk[[:space:]]+.*/compileSdk 36/' "$FILE_PICKER_GRADLE"
+
+          grep -nE 'compileSdk|compileSdkVersion' "$FILE_PICKER_GRADLE"
+
+      - name: Configure permanent release signing
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          set -e
+          if [ -z "$ANDROID_KEYSTORE_BASE64" ] || [ -z "$ANDROID_KEYSTORE_PASSWORD" ] || [ -z "$ANDROID_KEY_PASSWORD" ]; then
+            echo "Missing signing secrets. Add ANDROID_KEYSTORE_BASE64, ANDROID_KEYSTORE_PASSWORD, and ANDROID_KEY_PASSWORD in GitHub repository Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > android/app/rabay-cell-release.jks
+          cat > android/key.properties <<EOF
+          storePassword=$ANDROID_KEYSTORE_PASSWORD
+          keyPassword=$ANDROID_KEY_PASSWORD
+          keyAlias=rabay
+          storeFile=rabay-cell-release.jks
+          EOF
+          python3 configure_signing.py
+
+      - name: Build release APK
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rabay-cell-apk-signed
+          path: build/app/outputs/flutter-apk/app-release.apk
+          if-no-files-found: error
