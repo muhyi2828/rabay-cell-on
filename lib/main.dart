@@ -45,8 +45,14 @@ Future<void> initNotifications() async {
   await android?.requestNotificationsPermission();
 }
 
+
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
+
+  await Supabase.initialize(
+    url: 'https://kgdpzpvqdmohydzmmtdz.supabase.co',
+    publishableKey: 'sb_publishable_D6Je5aCl5PYezbrnTkWTyA_OzAdcGyR',
+  );
 
   await initializeDateFormatting('id_ID', null);
   await initNotifications();
