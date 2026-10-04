@@ -18,6 +18,7 @@ import 'package:timezone/data/latest.dart' as tzdata;
 import 'package:timezone/timezone.dart' as tz;
 import 'package:supabase_flutter/supabase_flutter.dart';
 
+
 final FlutterLocalNotificationsPlugin notifications =
     FlutterLocalNotificationsPlugin();
 
@@ -44,7 +45,6 @@ Future<void> initNotifications() async {
       AndroidFlutterLocalNotificationsPlugin>();
   await android?.requestNotificationsPermission();
 }
-
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -103,6 +103,22 @@ Future<void> scheduleClosingReminder({
  
 final money = NumberFormat.currency(locale: 'id_ID', symbol: 'Rp ', decimalDigits: 0);
 final dateFmt = DateFormat('dd MMM yyyy, HH:mm', 'id_ID');
+
+Widget _productThumbnail(Uint8List? imageData, {double size = 38}) {
+  return Container(
+    width: size,
+    height: size,
+    decoration: BoxDecoration(
+      color: const Color(0xFFDCE9E7),
+      borderRadius: BorderRadius.circular(8),
+    ),
+    clipBehavior: Clip.antiAlias,
+    child: imageData != null && imageData.isNotEmpty
+        ? Image.memory(imageData, fit: BoxFit.cover, errorBuilder: (_, __, ___) =>
+            const Icon(Icons.image_outlined, size: 19, color: Colors.black38))
+        : const Icon(Icons.image_outlined, size: 19, color: Colors.black38),
+  );
+}
 
 // Data lama mungkin memiliki tanggal kosong atau format yang tidak valid.
 // Fungsi ini mencegah satu baris rusak membuat seluruh daftar menjadi kotak abu-abu.
@@ -178,12 +194,12 @@ class PosDb {
   Database get db => _db!;
   Future<void> init() async {
     final dir = await getApplicationDocumentsDirectory();
-    _db = await openDatabase(p.join(dir.path, 'pos_offline.db'), version: 4,
+    _db = await openDatabase(p.join(dir.path, 'pos_offline.db'), version: 5,
       onCreate: (d, v) async {
         await d.execute('''CREATE TABLE products(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
           barcode TEXT NOT NULL UNIQUE, cost INTEGER NOT NULL, price INTEGER NOT NULL, stock INTEGER NOT NULL DEFAULT 0,
-          category TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)''');
+          category TEXT NOT NULL DEFAULT '', image_data BLOB, updated_at TEXT NOT NULL)''');
         await d.execute('''CREATE TABLE transactions(
           id INTEGER PRIMARY KEY AUTOINCREMENT, total INTEGER NOT NULL, profit INTEGER NOT NULL,
           paid INTEGER NOT NULL, change_amount INTEGER NOT NULL, created_at TEXT NOT NULL,
@@ -227,6 +243,9 @@ class PosDb {
           if (oldVersion < 4) {
             await d.execute("ALTER TABLE products ADD COLUMN category TEXT NOT NULL DEFAULT ''");
           }
+          if (oldVersion < 5) {
+            await d.execute('ALTER TABLE products ADD COLUMN image_data BLOB');
+          }
       });
       // Non-destructive repair for older rows whose timestamp field is blank.
       // Exact historical time cannot be reconstructed; use the repair time only for blank rows.
@@ -262,15 +281,31 @@ class PosDb {
     final r = await db.query('products', where: 'barcode = ? OR code = ?', whereArgs: [barcode, barcode], limit: 1);
     return r.isEmpty ? null : r.first;
   }
+
+  Future<Map<String, Object?>?> productById(int id) async {
+    final r = await db.query('products', where: 'id = ?', whereArgs: [id], limit: 1);
+    return r.isEmpty ? null : r.first;
+  }
   Future<void> saveProduct({int? id, required String name, required String code, required String barcode,
-    required int cost, required int price, required int stock, required String category}) async {
+    required int cost, required int price, required int stock, required String category, Uint8List? imageData}) async {
     final data = {'name': name.trim(), 'code': code.trim(), 'barcode': barcode.trim(),
-      'cost': cost, 'price': price, 'stock': stock, 'category': category.trim(), 'updated_at': DateTime.now().toIso8601String()};
+      'cost': cost, 'price': price, 'stock': stock, 'category': category.trim(),
+      'image_data': imageData, 'updated_at': DateTime.now().toIso8601String()};
     if (id == null) {
       await db.insert('products', data);
     } else {
       await db.update('products', data, where: 'id = ?', whereArgs: [id]);
     }
+  }
+
+  Future<void> deleteProduct(int id) async {
+    // Prevent deleting a product that is still referenced by the saved cart.
+    final savedCart = await loadCart();
+    final cartItems = (savedCart?['items'] as List? ?? []).whereType<Map>();
+    if (cartItems.any((row) => row['productId'] == id)) {
+      throw Exception('Barang masih ada di keranjang. Hapus dari keranjang terlebih dahulu.');
+    }
+    await db.delete('products', where: 'id = ?', whereArgs: [id]);
   }
 
   Future<void> checkout(List<CartLine> cart, int paid) async {
@@ -824,10 +859,11 @@ class PosDb {
 class CartLine {
   final int productId;
   final String name, barcode;
+  final Uint8List? imageData;
   final int cost, price;
   int qty;
   CartLine({required this.productId, required this.name, required this.barcode,
-    required this.cost, required this.price, this.qty = 1});
+    this.imageData, required this.cost, required this.price, this.qty = 1});
   int get subtotal => price * qty;
 }
 
@@ -1030,7 +1066,21 @@ class _CashierPageState extends State<CashierPage> {
   Future<void> _restoreCart() async {
     final saved = await PosDb.instance.loadCart();
     if (!mounted || saved == null) return;
-    final items = (saved['items'] as List? ?? []).whereType<Map>().map((x) => CartLine(productId: x['productId'] as int, name: x['name'] as String, barcode: x['barcode'] as String, cost: x['cost'] as int, price: x['price'] as int, qty: x['qty'] as int)).toList();
+    final items = <CartLine>[];
+    for (final x in (saved['items'] as List? ?? []).whereType<Map>()) {
+      final productId = x['productId'] as int;
+      final product = await PosDb.instance.productById(productId);
+      items.add(CartLine(
+        productId: productId,
+        name: x['name'] as String,
+        barcode: x['barcode'] as String,
+        imageData: product?['image_data'] as Uint8List?,
+        cost: x['cost'] as int,
+        price: x['price'] as int,
+        qty: x['qty'] as int,
+      ));
+    }
+    if (!mounted) return;
     setState(() { cart..clear()..addAll(items); paid.text = saved['paid'] as String? ?? ''; });
   }
   Future<void> _persistCart() => PosDb.instance.saveCart(cart, paid.text);
@@ -1049,9 +1099,15 @@ class _CashierPageState extends State<CashierPage> {
     final id = product['id'] as int;
     final existing = cart.where((x) => x.productId == id).toList();
     _cartChanged(() {
-      if (existing.isNotEmpty) { existing.first.qty++; }
-      else { cart.add(CartLine(productId: id, name: product['name'] as String, barcode: product['barcode'] as String,
-        cost: product['cost'] as int, price: product['price'] as int)); }
+      if (existing.isNotEmpty) {
+        final line = existing.first;
+        line.qty++;
+        cart.remove(line);
+        cart.insert(0, line);
+      } else {
+        cart.insert(0, CartLine(productId: id, name: product['name'] as String, barcode: product['barcode'] as String,
+          imageData: product['image_data'] as Uint8List?, cost: product['cost'] as int, price: product['price'] as int));
+      }
     });
     focus.requestFocus();
   }
@@ -1137,17 +1193,38 @@ Future<void> finishSale() async {
     ])) : ListView.separated(itemCount: cart.length, separatorBuilder: (_, __) => const SizedBox(height: 8),
       itemBuilder: (_, i) {
         final line = cart[i];
-        return Card(child: Padding(padding: const EdgeInsets.all(12), child: Row(children: [
-          Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(line.name, style: const TextStyle(fontWeight: FontWeight.w700)),
-            Text('${money.format(line.price)} × ${line.qty}', style: TextStyle(color: Colors.grey.shade600)),
-            if (widget.showPrivate) Text('Modal: ${money.format(line.cost)} • Untung: ${money.format((line.price-line.cost)*line.qty)}', style: const TextStyle(color: Colors.green)),
-          ])),
-          IconButton(onPressed: () => _cartChanged(() { if (line.qty > 1) line.qty--; else cart.removeAt(i); }), icon: const Icon(Icons.remove_circle_outline)),
-          Text('${line.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
-          IconButton(onPressed: () => _cartChanged(() => line.qty++), icon: const Icon(Icons.add_circle_outline)),
-          IconButton(onPressed: () => _cartChanged(() => cart.removeAt(i)), icon: const Icon(Icons.delete_outline, color: Colors.red)),
-        ])));
+        return Card(
+          color: i == 0 ? const Color(0xFFE5EFEE) : Colors.white,
+          margin: EdgeInsets.zero,
+          child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7), child: Row(children: [
+            _productThumbnail(line.imageData, size: 36),
+            const SizedBox(width: 7),
+            Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
+              Text(line.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
+              Text('${money.format(line.price)} × ${line.qty}', maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: Colors.grey.shade700, fontSize: 12)),
+              if (widget.showPrivate) Text('Modal: ${money.format(line.cost)} • Untung: ${money.format((line.price-line.cost)*line.qty)}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.green, fontSize: 10)),
+            ])),
+            IconButton(visualDensity: VisualDensity.compact, constraints: const BoxConstraints(minWidth: 34, minHeight: 34), padding: EdgeInsets.zero, onPressed: () => _cartChanged(() { if (line.qty > 1) line.qty--; else cart.remove(line); }), icon: const Icon(Icons.remove_circle_outline, size: 21)),
+            Text('${line.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
+            IconButton(visualDensity: VisualDensity.compact, constraints: const BoxConstraints(minWidth: 34, minHeight: 34), padding: EdgeInsets.zero, onPressed: () => _cartChanged(() { line.qty++; cart.remove(line); cart.insert(0, line); }), icon: const Icon(Icons.add_circle_outline, size: 21)),
+            IconButton(
+              visualDensity: VisualDensity.compact,
+              constraints: const BoxConstraints(minWidth: 32, minHeight: 34),
+              padding: EdgeInsets.zero,
+              onPressed: () async {
+                final confirm = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
+                  title: const Text('Hapus dari keranjang?'),
+                  content: Text('Hapus "${line.name}" dari keranjang?'),
+                  actions: [
+                    TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Batal')),
+                    FilledButton(style: FilledButton.styleFrom(backgroundColor: Colors.red), onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Hapus')),
+                  ],
+                ));
+                if (confirm == true && mounted) _cartChanged(() => cart.remove(line));
+              },
+              icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+            ),
+          ])));
       })),
     Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(children: [
       Row(children: [const Expanded(child: Text('Total', style: TextStyle(fontSize: 16))), Text(money.format(total), style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800))]),
@@ -1184,6 +1261,7 @@ class _ProductsPageState extends State<ProductsPage> {
     final price = TextEditingController(text: item?['price']?.toString() ?? '');
     final stock = TextEditingController(text: item?['stock']?.toString() ?? '0');
     final category = TextEditingController(text: item?['category'] as String? ?? '');
+    Uint8List? imageData = item?['image_data'] as Uint8List?;
     final existingCategories = await PosDb.instance.categories();
     const newCategoryOption = '＋ Kategori baru';
     String selectedCategoryValue = existingCategories.contains(category.text.trim())
@@ -1191,8 +1269,61 @@ class _ProductsPageState extends State<ProductsPage> {
         : newCategoryOption;
     final key = GlobalKey<FormState>();
     final saved = await showDialog<bool>(context: context, builder: (ctx) => StatefulBuilder(builder: (ctx, setDialogState) => AlertDialog(
-      title: Text(item == null ? 'Tambah barang' : 'Edit barang'),
+      title: Row(children: [
+        Expanded(child: Text(item == null ? 'Tambah barang' : 'Edit barang')),
+        if (item != null) IconButton(
+          tooltip: 'Hapus barang',
+          visualDensity: VisualDensity.compact,
+          icon: const Icon(Icons.delete_outline, color: Colors.red, size: 23),
+          onPressed: () async {
+            final confirm = await showDialog<bool>(context: ctx, builder: (confirmCtx) => AlertDialog(
+              title: const Text('Hapus barang?'),
+              content: Text('Barang "${item['name']}" akan dihapus dari daftar stok. Riwayat transaksi sebelumnya tetap tersimpan. Tindakan ini tidak dapat dibatalkan.'),
+              actions: [
+                TextButton(onPressed: () => Navigator.pop(confirmCtx, false), child: const Text('Batal')),
+                FilledButton(style: FilledButton.styleFrom(backgroundColor: Colors.red), onPressed: () => Navigator.pop(confirmCtx, true), child: const Text('Hapus barang')),
+              ],
+            ));
+            if (confirm != true) return;
+            try {
+              await PosDb.instance.deleteProduct(item['id'] as int);
+              if (ctx.mounted) Navigator.pop(ctx, false);
+              if (mounted) {
+                await refresh();
+                ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Barang berhasil dihapus.')));
+              }
+            } catch (e) {
+              if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gagal menghapus barang: $e')));
+            }
+          },
+        ),
+      ]),
       content: SizedBox(width: 480, child: SingleChildScrollView(child: Form(key: key, child: Column(mainAxisSize: MainAxisSize.min, children: [
+        Row(children: [
+          _productThumbnail(imageData, size: 58),
+          const SizedBox(width: 12),
+          Expanded(child: OutlinedButton.icon(
+            onPressed: () async {
+              try {
+                final picked = await FilePicker.platform.pickFiles(type: FileType.image, allowMultiple: false);
+                if (picked == null || picked.files.isEmpty) return;
+                final sourcePath = picked.files.single.path;
+                if (sourcePath == null || sourcePath.isEmpty) throw Exception('File gambar tidak dapat dibaca.');
+                final bytes = await File(sourcePath).readAsBytes();
+                setDialogState(() => imageData = bytes);
+              } catch (e) {
+                if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gagal memilih foto: $e')));
+              }
+            },
+            icon: const Icon(Icons.upload_file_outlined),
+            label: const Text('Pilih foto barang'),
+          )),
+          if (imageData != null && imageData!.isNotEmpty) IconButton(
+            tooltip: 'Hapus foto', icon: const Icon(Icons.close),
+            onPressed: () => setDialogState(() => imageData = null),
+          ),
+        ]),
+        const SizedBox(height: 12),
         _field(name, 'Nama barang'), _field(code, 'Kode barang'), _field(barcode, 'Barcode'),
         DropdownButtonFormField<String>(
           value: selectedCategoryValue,
@@ -1211,6 +1342,7 @@ class _ProductsPageState extends State<ProductsPage> {
         ),
         if (selectedCategoryValue == newCategoryOption)
           _field(category, 'Nama kategori baru (contoh: Pulsa, Aksesoris)'),
+        const SizedBox(height: 8),
         _field(cost, 'Harga modal (Rp)', numeric: true), _field(price, 'Harga jual (Rp)', numeric: true),
         _field(stock, 'Stok', numeric: true),
       ])))),
@@ -1223,7 +1355,8 @@ class _ProductsPageState extends State<ProductsPage> {
       try {
         await PosDb.instance.saveProduct(id: item?['id'] as int?, name: name.text, code: code.text, barcode: barcode.text,
           cost: int.parse(cost.text), price: int.parse(price.text), stock: int.parse(stock.text),
-          category: selectedCategoryValue == newCategoryOption ? category.text : selectedCategoryValue);
+          category: selectedCategoryValue == newCategoryOption ? category.text : selectedCategoryValue,
+          imageData: imageData);
         await refresh();
       } catch (e) {
         if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gagal menyimpan. Pastikan kode dan barcode unik. $e')));
@@ -1379,6 +1512,8 @@ return ColoredBox(
           child: Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
+              _productThumbnail(x['image_data'] as Uint8List?, size: 56),
+              const SizedBox(width: 8),
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
