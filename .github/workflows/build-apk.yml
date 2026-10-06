@@ -28,6 +28,15 @@ jobs:
       - name: Configure native repeating alarm
         run: python3 configure_alarm_v14.py
 
+      - name: Fix native photo picker imports
+        run: python3 configure_photo_picker_v2.py
+
+      - name: Show MainActivity for debugging
+        run: |
+          echo "========== MainActivity.kt =========="
+          cat android/app/src/main/kotlin/com/example/rabay_cell/MainActivity.kt
+          echo "========== END MainActivity.kt =========="
+
       - name: Configure scheduled notification receivers
         run: |
           python3 - <<'PYCODE'
