@@ -3,9 +3,9 @@ import 'dart:io';
 import 'dart:math';
 import 'dart:typed_data';
 import 'package:crypto/crypto.dart';
-import 'package:file_picker/file_picker.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:cross_file/cross_file.dart';
+import 'package:file_picker/file_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:intl/intl.dart';
@@ -23,6 +23,7 @@ final FlutterLocalNotificationsPlugin notifications =
     FlutterLocalNotificationsPlugin();
 
 const MethodChannel _nativeAlarmChannel = MethodChannel('rabay_cell/alarm');
+const MethodChannel _photoPickerChannel = MethodChannel('rabay_cell/photo_picker');
 
 Future<void> initNotifications() async {
   tzdata.initializeTimeZones();
@@ -49,7 +50,7 @@ Future<void> initNotifications() async {
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
 
-  await Supabase.initialize(
+await Supabase.initialize(
     url: 'https://kgdpzpvqdmohydzmmtdz.supabase.co',
     publishableKey: 'sb_publishable_D6Je5aCl5PYezbrnTkWTyA_OzAdcGyR',
   );
@@ -64,6 +65,11 @@ void main() async {
 
 Future<void> restoreClosingReminder() async {
   try {
+    final enabled = (await PosDb.instance.setting('closing_reminder_enabled') ?? 'true') == 'true';
+    if (!enabled) {
+      await _nativeAlarmChannel.invokeMethod<void>('cancelDailyAlarm');
+      return;
+    }
     final time = await PosDb.instance.setting('closing_time');
     final message = await PosDb.instance.setting('closing_message');
     final sound = (await PosDb.instance.setting('closing_sound') ?? 'true') == 'true';
@@ -104,6 +110,7 @@ Future<void> scheduleClosingReminder({
 final money = NumberFormat.currency(locale: 'id_ID', symbol: 'Rp ', decimalDigits: 0);
 final dateFmt = DateFormat('dd MMM yyyy, HH:mm', 'id_ID');
 
+// Foto produk disimpan sebagai BLOB di SQLite privat aplikasi; tidak membuat file gambar publik.
 Widget _productThumbnail(Uint8List? imageData, {double size = 38}) {
   return Container(
     width: size,
@@ -159,6 +166,18 @@ String safeDateFormat(Object? value) {
   }
 }
 
+String sessionDateFormat(Object? value) {
+  final text = value?.toString().trim() ?? '';
+  if (text.isEmpty || text.toLowerCase() == 'null') return '-';
+  const months = ['Jan', 'Feb', 'Mar', 'Apr', 'Mei', 'Jun', 'Jul', 'Agu', 'Sep', 'Okt', 'Nov', 'Des'];
+  try {
+    final date = _parseJakartaDate(value);
+    return '${date.day.toString().padLeft(2, '0')} ${months[date.month - 1]} ${date.year}';
+  } catch (_) {
+    return '-';
+  }
+}
+
 class PosApp extends StatelessWidget {
   const PosApp({super.key});
   @override
@@ -183,7 +202,7 @@ class PosApp extends StatelessWidget {
         enabledBorder: OutlineInputBorder(borderRadius: BorderRadius.circular(14), borderSide: BorderSide(color: Colors.grey.shade300)),
       ),
     ),
-    home: const HomeScreen(),
+    home: const AuthGate(),
   );
 }
 
@@ -194,7 +213,7 @@ class PosDb {
   Database get db => _db!;
   Future<void> init() async {
     final dir = await getApplicationDocumentsDirectory();
-    _db = await openDatabase(p.join(dir.path, 'pos_offline.db'), version: 5,
+    _db = await openDatabase(p.join(dir.path, 'pos_offline.db'), version: 6,
       onCreate: (d, v) async {
         await d.execute('''CREATE TABLE products(
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, code TEXT NOT NULL UNIQUE,
@@ -221,7 +240,7 @@ class PosDb {
           changed_at TEXT NOT NULL, old_total INTEGER NOT NULL, new_total INTEGER NOT NULL,
           note TEXT NOT NULL)''');
         await d.execute('''CREATE TABLE settings(key TEXT PRIMARY KEY, value TEXT NOT NULL)''');
-        await d.execute('''CREATE TABLE sessions(id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, closed_at TEXT, total_sales INTEGER NOT NULL DEFAULT 0, total_profit INTEGER NOT NULL DEFAULT 0, transaction_count INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0)''');
+        await d.execute('''CREATE TABLE sessions(id INTEGER PRIMARY KEY AUTOINCREMENT, started_at TEXT NOT NULL, closed_at TEXT, title TEXT NOT NULL DEFAULT '', total_sales INTEGER NOT NULL DEFAULT 0, total_profit INTEGER NOT NULL DEFAULT 0, transaction_count INTEGER NOT NULL DEFAULT 0, archived INTEGER NOT NULL DEFAULT 0)''');
         await d.insert('sessions', {'started_at': DateTime.now().toIso8601String()});
       },
       onUpgrade: (d, oldVersion, newVersion) async {
@@ -245,6 +264,9 @@ class PosDb {
           }
           if (oldVersion < 5) {
             await d.execute('ALTER TABLE products ADD COLUMN image_data BLOB');
+          }
+          if (oldVersion < 6) {
+            await d.execute("ALTER TABLE sessions ADD COLUMN title TEXT NOT NULL DEFAULT ''");
           }
       });
       // Non-destructive repair for older rows whose timestamp field is blank.
@@ -278,7 +300,13 @@ class PosDb {
   }
 
   Future<Map<String, Object?>?> productByBarcode(String barcode) async {
-    final r = await db.query('products', where: 'barcode = ? OR code = ?', whereArgs: [barcode, barcode], limit: 1);
+    final code = barcode.trim();
+    final r = await db.query(
+      'products',
+      where: 'barcode = ? COLLATE NOCASE OR code = ? COLLATE NOCASE',
+      whereArgs: [code, code],
+      limit: 1,
+    );
     return r.isEmpty ? null : r.first;
   }
 
@@ -652,7 +680,7 @@ class PosDb {
     await backup();
   }
 
-  Future<Map<String, Object?>> closeSession() async {
+  Future<Map<String, Object?>> closeSession({required String title}) async {
     final now = DateTime.now().toIso8601String();
     late Map<String, Object?> summary;
     await db.transaction((txn) async {
@@ -660,8 +688,8 @@ class PosDb {
       if (active.isEmpty) throw Exception('Sesi aktif tidak ditemukan.');
       final sid = active.first['id'] as int;
       final sums = await txn.rawQuery("SELECT COALESCE(SUM(total),0) AS sales, COALESCE(SUM(profit),0) AS profit, COUNT(*) AS cnt FROM transactions WHERE session_id = ? AND status != 'cancelled'", [sid]);
-      summary = {'id': sid, 'total_sales': sums.first['sales'], 'total_profit': sums.first['profit'], 'transaction_count': sums.first['cnt'], 'closed_at': now};
-      await txn.update('sessions', {'closed_at': now, 'total_sales': summary['total_sales'], 'total_profit': summary['total_profit'], 'transaction_count': summary['transaction_count'], 'archived': 1}, where: 'id = ?', whereArgs: [sid]);
+      summary = {'id': sid, 'title': title, 'started_at': active.first['started_at'], 'total_sales': sums.first['sales'], 'total_profit': sums.first['profit'], 'transaction_count': sums.first['cnt'], 'closed_at': now};
+      await txn.update('sessions', {'title': title, 'closed_at': now, 'total_sales': summary['total_sales'], 'total_profit': summary['total_profit'], 'transaction_count': summary['transaction_count'], 'archived': 1}, where: 'id = ?', whereArgs: [sid]);
       await txn.insert('sessions', {'started_at': now, 'archived': 0});
     });
     await backup();
@@ -780,6 +808,17 @@ class PosDb {
     return sha256.convert(utf8.encode('$salt:$pin')).toString() == hash;
   }
 
+  Future<void> _removePinSettingsFromBackup(String databasePath) async {
+    Database? backupDb;
+    try {
+      backupDb = await openDatabase(databasePath);
+      await backupDb.delete('settings', where: 'key IN (?, ?, ?)',
+        whereArgs: ['pin_hash', 'pin_salt', 'owner_pin_enabled']);
+    } finally {
+      await backupDb?.close();
+    }
+  }
+
   Future<File> createPortableBackup() async {
     // Checkpoint SQLite WAL so the exported database includes committed changes.
     await db.rawQuery('PRAGMA wal_checkpoint(FULL)');
@@ -790,12 +829,16 @@ class PosDb {
     final stamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
     final target = File(p.join(temp.path, 'rabay_cell_backup_$stamp.db'));
     await source.copy(target.path);
+    await _removePinSettingsFromBackup(target.path);
     return target;
   }
 
   Future<void> restorePortableBackup(String selectedPath) async {
     final selected = File(selectedPath);
     if (!await selected.exists()) throw Exception('File backup tidak ditemukan.');
+    final localPinHash = await setting('pin_hash');
+    final localPinSalt = await setting('pin_salt');
+    final localPinEnabled = await setting('owner_pin_enabled') ?? 'true';
     final dir = await getApplicationDocumentsDirectory();
     final targetPath = p.join(dir.path, 'pos_offline.db');
     final tempPath = p.join(dir.path, 'restore_validation.db');
@@ -828,6 +871,12 @@ class PosDb {
       await validationFile.copy(targetPath);
       await validationFile.delete();
       await init();
+      // Remove any legacy PIN bundled in the imported database, then retain only this device's PIN settings.
+      await db.delete('settings', where: 'key IN (?, ?, ?)',
+        whereArgs: ['pin_hash', 'pin_salt', 'owner_pin_enabled']);
+      await setSetting('owner_pin_enabled', localPinEnabled);
+      if (localPinHash != null) await setSetting('pin_hash', localPinHash);
+      if (localPinSalt != null) await setSetting('pin_salt', localPinSalt);
     } catch (_) {
       // Restore the previous database if opening the imported database fails.
       if (await safety.exists()) await safety.copy(targetPath);
@@ -845,7 +894,9 @@ class PosDb {
       final folder = Directory(p.join(dir.path, 'backups'));
       if (!await folder.exists()) await folder.create(recursive: true);
       final stamp = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
-      await source.copy(p.join(folder.path, 'pos_backup_$stamp.db'));
+      final backupPath = p.join(folder.path, 'pos_backup_$stamp.db');
+      await source.copy(backupPath);
+      await _removePinSettingsFromBackup(backupPath);
       // Keep the most recent 20 backup files.
       final files = folder.listSync().whereType<File>().toList()
         ..sort((a, b) => b.path.compareTo(a.path));
@@ -874,11 +925,22 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> with WidgetsBindingObserver {
   int tab = 0;
   bool unlocked = false;
+  bool pinEnabled = true;
+  final GlobalKey<_CashierPageState> _cashierKey = GlobalKey<_CashierPageState>();
 @override
 void initState() {
   super.initState();
   WidgetsBinding.instance.addObserver(this);
+  _loadPinState();
   showDailyReminder();
+}
+Future<void> _loadPinState() async {
+  final enabled = (await PosDb.instance.setting('owner_pin_enabled') ?? 'true') == 'true';
+  if (!mounted) return;
+  setState(() {
+    pinEnabled = enabled;
+    unlocked = !enabled;
+  });
 }
   @override void dispose() { WidgetsBinding.instance.removeObserver(this); super.dispose(); }
     Future<void> showDailyReminder() async {
@@ -948,7 +1010,7 @@ void initState() {
     }
   @override void didChangeAppLifecycleState(AppLifecycleState state) {
     if (state == AppLifecycleState.inactive || state == AppLifecycleState.paused || state == AppLifecycleState.detached) {
-      if (mounted && unlocked) setState(() => unlocked = false);
+      if (mounted && pinEnabled && unlocked) setState(() => unlocked = false);
     }
   }
   Future<String?> _pinDialog(String title, {bool allowCancel = true}) async {
@@ -967,6 +1029,14 @@ void initState() {
   }
   Future<bool> unlock() async {
     if (unlocked) return true;
+    final pinIsEnabled = (await PosDb.instance.setting('owner_pin_enabled') ?? 'true') == 'true';
+    if (!pinIsEnabled) {
+      if (mounted) setState(() {
+        pinEnabled = false;
+        unlocked = true;
+      });
+      return true;
+    }
     final existing = await PosDb.instance.setting('pin_hash');
     if (existing == null) {
       final pin = await _pinDialog('Buat PIN pemilik (pertama kali)', allowCancel: true);
@@ -988,15 +1058,25 @@ void initState() {
     if (pin == null) return false;
     final ok = await PosDb.instance.verifyPin(pin);
     if (!ok && mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN salah.')));
-    if (ok && mounted) setState(() => unlocked = true);
+    if (ok && mounted) setState(() {
+      pinEnabled = true;
+      unlocked = true;
+    });
     return ok;
   }
   @override Widget build(BuildContext context) {
     final pages = [
-      CashierPage(showPrivate: unlocked, requestUnlock: unlock),
+      CashierPage(key: _cashierKey, showPrivate: unlocked, requestUnlock: unlock),
       ProductsPage(showPrivate: unlocked, requestUnlock: unlock),
       TransactionsPage(showPrivate: unlocked, requestUnlock: unlock),
-      SettingsPage(onLock: () => setState(() => unlocked = false), requestUnlock: unlock),
+      SettingsPage(
+        onLock: () => setState(() => unlocked = false),
+        requestUnlock: unlock,
+        onPinStateChanged: (enabled) => setState(() {
+          pinEnabled = enabled;
+          unlocked = !enabled;
+        }),
+      ),
     ];
     return WillPopScope(
       onWillPop: () async {
@@ -1038,6 +1118,11 @@ void initState() {
           if (!ok) return;
         }
         if (mounted) setState(() => tab = i);
+        if (i == 0) {
+          WidgetsBinding.instance.addPostFrameCallback((_) {
+            _cashierKey.currentState?.focusBarcode();
+          });
+        }
       },
         destinations: const [
           NavigationDestination(icon: Icon(Icons.point_of_sale_outlined), selectedIcon: Icon(Icons.point_of_sale), label: 'Kasir'),
@@ -1084,6 +1169,11 @@ class _CashierPageState extends State<CashierPage> {
     setState(() { cart..clear()..addAll(items); paid.text = saved['paid'] as String? ?? ''; });
   }
   Future<void> _persistCart() => PosDb.instance.saveCart(cart, paid.text);
+  void focusBarcode() {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) focus.requestFocus();
+    });
+  }
   void _cartChanged(VoidCallback change) { setState(change); _persistCart(); }
   int get total => cart.fold(0, (s, x) => s + x.subtotal);
   @override void dispose() { scan.dispose(); paid.dispose(); focus.dispose(); super.dispose(); }
@@ -1112,19 +1202,100 @@ class _CashierPageState extends State<CashierPage> {
     focus.requestFocus();
   }
   Future<void> chooseProduct() async {
-    final all = await PosDb.instance.products(query: search);
+    // Lepaskan fokus dari input barcode saat membuka pencarian.
+    // Ini mencegah keyboard/scanner kembali mengambil fokus ketika
+    // pengguna mengetik di kolom pencarian.
+    focus.unfocus();
+
+    final all = await PosDb.instance.products();
     if (!mounted) return;
-    final selected = await showModalBottomSheet<Map<String, Object?>>(context: context, isScrollControlled: true,
-      builder: (ctx) => SafeArea(child: SizedBox(height: MediaQuery.of(ctx).size.height * .75,
-        child: Column(children: [
-          Padding(padding: const EdgeInsets.all(16), child: TextField(decoration: const InputDecoration(prefixIcon: Icon(Icons.search), hintText: 'Cari nama, kode, barcode'),
-            onChanged: (v) async { search = v; Navigator.pop(ctx); await chooseProduct(); })),
-          Expanded(child: ListView.builder(itemCount: all.length, itemBuilder: (_, i) {
-            final x = all[i]; return ListTile(title: Text('${x['name']}'), subtitle: Text('Stok: ${x['stock']}'),
-              trailing: Text(money.format(x['price'])), onTap: () => Navigator.pop(ctx, x));
-          }))
-        ]))));
-    if (selected != null) await addBarcode(selected['barcode'] as String);
+
+    final selected = await showModalBottomSheet<Map<String, Object?>>(
+      context: context,
+      isScrollControlled: true,
+      builder: (ctx) {
+        String query = '';
+
+        return StatefulBuilder(
+          builder: (ctx, setSheetState) {
+            final q = query.trim().toLowerCase();
+
+            final filtered = q.isEmpty
+                ? all
+                : all.where((x) {
+                    final name =
+                        (x['name']?.toString() ?? '').toLowerCase();
+                    final code =
+                        (x['code']?.toString() ?? '').toLowerCase();
+                    final barcode =
+                        (x['barcode']?.toString() ?? '').toLowerCase();
+                    final category =
+                        (x['category']?.toString() ?? '').toLowerCase();
+
+                    return name.contains(q) ||
+                        code.contains(q) ||
+                        barcode.contains(q) ||
+                        category.contains(q);
+                  }).toList();
+
+            return SafeArea(
+              child: SizedBox(
+                height: MediaQuery.of(ctx).size.height * .75,
+                child: Column(
+                  children: [
+                    Padding(
+                      padding: const EdgeInsets.fromLTRB(16, 16, 16, 8),
+                      child: TextField(
+                        autofocus: true,
+                        decoration: const InputDecoration(
+                          prefixIcon: Icon(Icons.search),
+                          hintText: 'Cari nama, kode, barcode',
+                        ),
+                        onChanged: (v) {
+                          setSheetState(() => query = v);
+                        },
+                      ),
+                    ),
+                    Expanded(
+                      child: filtered.isEmpty
+                          ? const Center(
+                              child: Text('Barang tidak ditemukan'),
+                            )
+                          : ListView.builder(
+                              itemCount: filtered.length,
+                              itemBuilder: (_, i) {
+                                final x = filtered[i];
+
+                                return ListTile(
+                                  title: Text('${x['name']}'),
+                                  subtitle: Text(
+                                    'Kode: ${x['code']} • Stok: ${x['stock']}',
+                                  ),
+                                  trailing: Text(
+                                    money.format(x['price']),
+                                  ),
+                                  onTap: () =>
+                                      Navigator.pop(ctx, x),
+                                );
+                              },
+                            ),
+                    ),
+                  ],
+                ),
+              ),
+            );
+          },
+        );
+      },
+    );
+
+    if (selected != null) {
+      await addBarcode(selected['barcode'] as String);
+    } else {
+      // Jika pencarian dibatalkan, kembalikan fokus barcode agar
+      // scanner USB/Bluetooth siap digunakan lagi.
+      focusBarcode();
+    }
   }
   
 Future<void> finishSale() async {
@@ -1177,7 +1348,7 @@ Future<void> finishSale() async {
   }
 }
 
-  @override Widget build(BuildContext context) => Padding(padding: const EdgeInsets.all(16), child: Column(children: [
+  @override Widget build(BuildContext context) => Padding(padding: const EdgeInsets.fromLTRB(8, 16, 8, 2), child: Column(children: [
     TextField(controller: scan, focusNode: focus, autofocus: true,
       decoration: const InputDecoration(prefixIcon: Icon(Icons.qr_code_scanner), labelText: 'Scan barcode lalu tekan Enter',
         hintText: 'Scanner USB/Bluetooth atau ketik kode'),
@@ -1197,45 +1368,98 @@ Future<void> finishSale() async {
           color: i == 0 ? const Color(0xFFE5EFEE) : Colors.white,
           margin: EdgeInsets.zero,
           child: Padding(padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 7), child: Row(children: [
-            _productThumbnail(line.imageData, size: 36),
+            _productThumbnail(line.imageData, size: 44),
             const SizedBox(width: 7),
             Expanded(child: Column(crossAxisAlignment: CrossAxisAlignment.start, mainAxisSize: MainAxisSize.min, children: [
               Text(line.name, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontWeight: FontWeight.w700)),
               Text('${money.format(line.price)} × ${line.qty}', maxLines: 1, overflow: TextOverflow.ellipsis, style: TextStyle(color: Colors.grey.shade700, fontSize: 12)),
-              if (widget.showPrivate) Text('Modal: ${money.format(line.cost)} • Untung: ${money.format((line.price-line.cost)*line.qty)}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.green, fontSize: 10)),
+              if (widget.showPrivate) Text('Untung: ${money.format((line.price-line.cost)*line.qty)}', maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(color: Colors.green, fontSize: 10)),
             ])),
-            IconButton(visualDensity: VisualDensity.compact, constraints: const BoxConstraints(minWidth: 34, minHeight: 34), padding: EdgeInsets.zero, onPressed: () => _cartChanged(() { if (line.qty > 1) line.qty--; else cart.remove(line); }), icon: const Icon(Icons.remove_circle_outline, size: 21)),
-            Text('${line.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
-            IconButton(visualDensity: VisualDensity.compact, constraints: const BoxConstraints(minWidth: 34, minHeight: 34), padding: EdgeInsets.zero, onPressed: () => _cartChanged(() { line.qty++; cart.remove(line); cart.insert(0, line); }), icon: const Icon(Icons.add_circle_outline, size: 21)),
             IconButton(
               visualDensity: VisualDensity.compact,
-              constraints: const BoxConstraints(minWidth: 32, minHeight: 34),
+              constraints: const BoxConstraints(minWidth: 34, minHeight: 34),
               padding: EdgeInsets.zero,
               onPressed: () async {
-                final confirm = await showDialog<bool>(context: context, builder: (dialogContext) => AlertDialog(
-                  title: const Text('Hapus dari keranjang?'),
-                  content: Text('Hapus "${line.name}" dari keranjang?'),
-                  actions: [
-                    TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Batal')),
-                    FilledButton(style: FilledButton.styleFrom(backgroundColor: Colors.red), onPressed: () => Navigator.pop(dialogContext, true), child: const Text('Hapus')),
-                  ],
-                ));
+                if (line.qty > 1) {
+                  _cartChanged(() => line.qty--);
+                  return;
+                }
+                final confirm = await showDialog<bool>(
+                  context: context,
+                  builder: (dialogContext) => AlertDialog(
+                    title: const Text('Hapus dari keranjang?'),
+                    content: Text('Hapus "${line.name}" dari keranjang?'),
+                    actions: [
+                      TextButton(onPressed: () => Navigator.pop(dialogContext, false), child: const Text('Batal')),
+                      FilledButton(
+                        style: FilledButton.styleFrom(backgroundColor: Colors.red),
+                        onPressed: () => Navigator.pop(dialogContext, true),
+                        child: const Text('Hapus'),
+                      ),
+                    ],
+                  ),
+                );
                 if (confirm == true && mounted) _cartChanged(() => cart.remove(line));
               },
-              icon: const Icon(Icons.delete_outline, color: Colors.red, size: 20),
+              icon: const Icon(Icons.remove_circle_outline, size: 21),
             ),
+            Text('${line.qty}', style: const TextStyle(fontWeight: FontWeight.bold)),
+            IconButton(visualDensity: VisualDensity.compact, constraints: const BoxConstraints(minWidth: 34, minHeight: 34), padding: EdgeInsets.zero, onPressed: () => _cartChanged(() { line.qty++; cart.remove(line); cart.insert(0, line); }), icon: const Icon(Icons.add_circle_outline, size: 21)),
+
           ])));
       })),
-    Card(child: Padding(padding: const EdgeInsets.all(16), child: Column(children: [
-      Row(children: [const Expanded(child: Text('Total', style: TextStyle(fontSize: 16))), Text(money.format(total), style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800))]),
-      if (widget.showPrivate) Align(alignment: Alignment.centerLeft, child: Text('Estimasi untung: ${money.format(cart.fold<int>(0, (s, x) => s + (x.price-x.cost)*x.qty))}', style: const TextStyle(color: Colors.green))),
-      const SizedBox(height: 12),
-      TextField(controller: paid, onChanged: (_) => _persistCart(), keyboardType: TextInputType.number, inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-        decoration: const InputDecoration(prefixIcon: Icon(Icons.payments_outlined), labelText: 'Uang diterima (Rp)')),
-      const SizedBox(height: 12),
-      Row(children: [Expanded(child: OutlinedButton.icon(onPressed: chooseProduct, icon: const Icon(Icons.add), label: const Text('Tambah barang'))),
-        const SizedBox(width: 10), Expanded(child: FilledButton.icon(onPressed: cart.isEmpty ? null : finishSale, icon: const Icon(Icons.check_circle_outline), label: const Text('Bayar')))]),
-    ]))),
+    Card(
+      margin: EdgeInsets.zero,
+      child: Padding(
+        // Dipadatkan agar kartu tidak memakan banyak ruang vertikal,
+        // sekaligus memberi ruang lebih lebar di kiri/kanan.
+        padding: const EdgeInsets.fromLTRB(8, 5, 8, 4),
+        child: Column(children: [
+          Row(children: [
+            const Expanded(child: Text('Total', style: TextStyle(fontSize: 16))),
+            Text(money.format(total), style: const TextStyle(fontSize: 24, fontWeight: FontWeight.w800)),
+          ]),
+          if (widget.showPrivate)
+            Align(
+              alignment: Alignment.centerLeft,
+              child: Text(
+                'Estimasi untung: ${money.format(cart.fold<int>(0, (s, x) => s + (x.price-x.cost)*x.qty))}',
+                style: const TextStyle(color: Colors.green),
+              ),
+            ),
+          const SizedBox(height: 7),
+          TextField(
+            controller: paid,
+            onChanged: (_) => _persistCart(),
+            keyboardType: TextInputType.number,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            decoration: const InputDecoration(
+              prefixIcon: Icon(Icons.payments_outlined),
+              labelText: 'Uang diterima (Rp)',
+              contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 7),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Row(children: [
+            Expanded(
+              child: OutlinedButton.icon(
+                onPressed: chooseProduct,
+                icon: const Icon(Icons.add, size: 20),
+                label: const Text('Tambah barang', maxLines: 1, softWrap: false, style: TextStyle(fontSize: 11)),
+              ),
+            ),
+            const SizedBox(width: 8),
+            Expanded(
+              child: FilledButton.icon(
+                onPressed: cart.isEmpty ? null : finishSale,
+                icon: const Icon(Icons.check_circle_outline, size: 20),
+                label: const Text('Bayar'),
+              ),
+            ),
+          ]),
+        ]),
+      ),
+    ),
   ]));
 }
 
@@ -1305,11 +1529,13 @@ class _ProductsPageState extends State<ProductsPage> {
           Expanded(child: OutlinedButton.icon(
             onPressed: () async {
               try {
-                final picked = await FilePicker.platform.pickFiles(type: FileType.image, allowMultiple: false);
-                if (picked == null || picked.files.isEmpty) return;
-                final sourcePath = picked.files.single.path;
-                if (sourcePath == null || sourcePath.isEmpty) throw Exception('File gambar tidak dapat dibaca.');
-                final bytes = await File(sourcePath).readAsBytes();
+                Uint8List? bytes;
+                bytes = await _photoPickerChannel.invokeMethod<Uint8List>('pickImageBytes');
+                if (bytes == null || bytes!.isEmpty) {
+                  throw Exception('File gambar tidak dapat dibaca sebagai data aplikasi.');
+                }
+                // Hanya byte gambar yang disimpan ke SQLite privat aplikasi.
+                // Tidak ada fallback FilePicker dan aplikasi tidak menyalin gambar ke Pictures/DCIM.
                 setDialogState(() => imageData = bytes);
               } catch (e) {
                 if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gagal memilih foto: $e')));
@@ -1862,50 +2088,62 @@ Expanded(
   child: FilledButton.icon(
     onPressed: () async {
       if (!(widget.showPrivate || await widget.requestUnlock())) return;
+      final titleController = TextEditingController();
       final ok = await showDialog<bool>(
         context: context,
         builder: (c) => AlertDialog(
           title: const Text('Tutup sesi / jumlahkan'),
-          content: const Text(
-            'Transaksi pada sesi ini akan dijumlahkan dan diarsipkan. '
-            'Sesi baru akan dimulai. Lanjutkan?',
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text('Transaksi pada sesi ini akan dijumlahkan dan diarsipkan. Sesi baru akan dimulai.'),
+              const SizedBox(height: 14),
+              TextField(
+                controller: titleController,
+                textCapitalization: TextCapitalization.sentences,
+                decoration: const InputDecoration(
+                  labelText: 'Judul sesi',
+                  hintText: 'Contoh: Shift pagi / Setoran mingguan',
+                  border: OutlineInputBorder(),
+                ),
+              ),
+            ],
           ),
           actions: [
-            TextButton(
-              onPressed: () => Navigator.pop(c, false),
-              child: const Text('Batal'),
-            ),
-            FilledButton(
-              onPressed: () => Navigator.pop(c, true),
-              child: const Text('Tutup sesi'),
-            ),
+            TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('Batal')),
+            FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('Tutup sesi')),
           ],
         ),
       );
 
       if (ok == true) {
-        final result = await PosDb.instance.closeSession();
+        final sessionTitle = titleController.text.trim();
+        titleController.dispose();
+        final result = await PosDb.instance.closeSession(title: sessionTitle);
         if (mounted) setState(() {});
         if (!mounted) return;
-
+        final dateRange = '${sessionDateFormat(result['started_at'])} - ${sessionDateFormat(result['closed_at'])}';
         showDialog(
           context: context,
           builder: (context) => AlertDialog(
-            title: Text('Sesi #${result['id']} diarsipkan'),
-            content: Text(
-              'Jumlah transaksi: ${result['transaction_count']}\n'
-              'Total omzet: ${money.format(result['total_sales'])}\n'
-              'Total keuntungan: ${money.format(result['total_profit'])}\n'
-              'Ditutup: ${safeDateFormat(result['closed_at'])}',
+            title: Text(sessionTitle.isEmpty ? 'Sesi #${result['id']} diarsipkan' : '"$sessionTitle" diarsipkan'),
+            content: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(dateRange, style: TextStyle(fontSize: 12, color: Colors.grey.shade700)),
+                const SizedBox(height: 8),
+                Text('${result['transaction_count']} transaksi', style: const TextStyle(fontWeight: FontWeight.w600)),
+                Text('Omzet: ${money.format(result['total_sales'])}', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+                Text('Keuntungan: ${money.format(result['total_profit'])}'),
+              ],
             ),
-            actions: [
-              FilledButton(
-                onPressed: () => Navigator.pop(context),
-                child: const Text('Selesai'),
-              ),
-            ],
+            actions: [FilledButton(onPressed: () => Navigator.pop(context), child: const Text('Selesai'))],
           ),
         );
+      } else {
+        titleController.dispose();
       }
     },
     icon: const Icon(Icons.archive_outlined),
@@ -1933,20 +2171,28 @@ Expanded(
                               itemCount: sessions.length,
                               itemBuilder: (context, index) {
                                 final ss = sessions[index];
+                                final storedTitle = (ss['title'] as String? ?? '').trim();
+                                final archiveTitle = storedTitle.isEmpty ? 'Sesi #${ss['id']}' : storedTitle;
                                 return Card(
                                   color: Colors.white,
+                                  margin: const EdgeInsets.symmetric(vertical: 4),
                                   child: ListTile(
-                                    title: Text('Sesi #${ss['id']}'),
-                                    subtitle: Text(
-                                      '${safeDateFormat(ss['started_at'])} - '
-                                      '${ss['closed_at'] == null ? '-' : safeDateFormat(ss['closed_at'])}\n'
-                                      '${ss['transaction_count']} transaksi',
-                                    ),
-                                    trailing: Row(
+                                    dense: true,
+                                    title: Text(archiveTitle, maxLines: 1, overflow: TextOverflow.ellipsis, style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                                    subtitle: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.start,
                                       mainAxisSize: MainAxisSize.min,
                                       children: [
-                                        Text(money.format(ss['total_sales'] ?? 0)),
-                                        IconButton(
+                                        Text('${sessionDateFormat(ss['started_at'])} - ${sessionDateFormat(ss['closed_at'])}', style: TextStyle(fontSize: 11, color: Colors.grey.shade700)),
+                                        const SizedBox(height: 3),
+                                        Row(children: [
+                                          Text('${ss['transaction_count']} transaksi', style: const TextStyle(fontSize: 12)),
+                                          const Spacer(),
+                                          Text(money.format(ss['total_sales'] ?? 0), style: const TextStyle(fontSize: 15, fontWeight: FontWeight.bold)),
+                                        ]),
+                                      ],
+                                    ),
+                                    trailing: IconButton(
                                           tooltip: 'Hapus baris arsip ini',
                                           icon: const Icon(Icons.delete_outline, color: Colors.red),
                                           onPressed: () async {
@@ -1990,8 +2236,6 @@ Expanded(
                                               }
                                             }
                                           },
-                                        ),
-                                      ],
                                     ),
                                     onTap: () async {
                                       try {
@@ -2000,7 +2244,7 @@ Expanded(
                                         await showDialog<void>(
                                           context: dialogContext,
                                           builder: (detailContext) => AlertDialog(
-                                            title: Text('Riwayat sesi #${ss['id']}'),
+                                            title: Text('Riwayat $archiveTitle'),
                                             content: SizedBox(
                                               width: double.maxFinite,
                                               height: 420,
@@ -2216,11 +2460,84 @@ Expanded(
 class SettingsPage extends StatefulWidget {
   final VoidCallback onLock;
   final Future<bool> Function() requestUnlock;
-  const SettingsPage({super.key, required this.onLock, required this.requestUnlock});
+  final ValueChanged<bool> onPinStateChanged;
+  const SettingsPage({super.key, required this.onLock, required this.requestUnlock, required this.onPinStateChanged});
   @override State<SettingsPage> createState() => _SettingsPageState();
 }
 class _SettingsPageState extends State<SettingsPage> {
-    
+  bool reminderEnabled = true;
+  bool pinEnabled = true;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadFeatureFlags();
+  }
+
+  Future<void> _loadFeatureFlags() async {
+    final alarm = (await PosDb.instance.setting('closing_reminder_enabled') ?? 'true') == 'true';
+    final pin = (await PosDb.instance.setting('owner_pin_enabled') ?? 'true') == 'true';
+    if (mounted) setState(() { reminderEnabled = alarm; pinEnabled = pin; });
+  }
+
+  Future<void> _toggleReminder(bool enabled) async {
+    if (!enabled) {
+      try {
+        await _nativeAlarmChannel.invokeMethod<void>('cancelDailyAlarm');
+        await PosDb.instance.setSetting('closing_reminder_enabled', 'false');
+        if (mounted) setState(() => reminderEnabled = false);
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('Pengingat harian dimatikan.')));
+      } catch (e) {
+        if (mounted) ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gagal mematikan alarm. Pastikan script alarm terbaru dipasang. $e')));
+      }
+      return;
+    }
+    await configureClosingReminder();
+    final isEnabled = (await PosDb.instance.setting('closing_reminder_enabled') ?? 'false') == 'true';
+    if (mounted) setState(() => reminderEnabled = isEnabled);
+  }
+
+  Future<void> _toggleOwnerPin(bool enabled) async {
+    if (!enabled) {
+      if (!await _requireOwner()) return;
+      if (!mounted) return;
+      final confirm = await showDialog<bool>(context: context, builder: (ctx) => AlertDialog(
+        title: const Text('Matikan PIN pemilik?'),
+        content: const Text('PIN dan salt akan dihapus dari perangkat ini. Informasi modal dan keuntungan tidak lagi dilindungi PIN. Saat diaktifkan kembali, Anda harus membuat PIN baru.'),
+        actions: [TextButton(onPressed: () => Navigator.pop(ctx, false), child: const Text('Batal')),
+          FilledButton(onPressed: () => Navigator.pop(ctx, true), child: const Text('Matikan PIN'))],
+      ));
+      if (confirm != true) return;
+      await PosDb.instance.db.delete('settings', where: 'key IN (?, ?)', whereArgs: ['pin_hash', 'pin_salt']);
+      await PosDb.instance.setSetting('owner_pin_enabled', 'false');
+      if (mounted) {
+        setState(() => pinEnabled = false);
+        widget.onPinStateChanged(false);
+        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN pemilik dimatikan dan PIN lama dihapus.')));
+      }
+      return;
+    }
+
+    final first = await _askPin('Buat PIN pemilik baru (4–8 digit)');
+    if (first == null) return;
+    if (first.length < 4 || first.length > 8) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN harus 4–8 digit.')));
+      return;
+    }
+    final second = await _askPin('Ulangi PIN pemilik baru');
+    if (second != first) {
+      if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN tidak sama. Coba lagi.')));
+      return;
+    }
+    await PosDb.instance.setPin(first);
+    await PosDb.instance.setSetting('owner_pin_enabled', 'true');
+    if (mounted) {
+      setState(() => pinEnabled = true);
+      widget.onLock();
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN pemilik baru berhasil diaktifkan.')));
+    }
+  }
+
 Future<void> configureClosingReminder() async {
   final messageController = TextEditingController(
     text: await PosDb.instance.setting('closing_message') ??
@@ -2401,6 +2718,7 @@ Future<void> configureClosingReminder() async {
       message: message,
       soundEnabled: soundEnabled,
     );
+    await PosDb.instance.setSetting('closing_reminder_enabled', 'true');
   } catch (e) {
     if (mounted) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -2411,6 +2729,7 @@ Future<void> configureClosingReminder() async {
   }
 
   if (mounted) {
+    setState(() => reminderEnabled = true);
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(content: Text('Pengingat disimpan untuk pukul $normalizedTime.')),
     );
@@ -2433,7 +2752,11 @@ Future<void> configureClosingReminder() async {
       return;
     }
     await PosDb.instance.setPin(next);
-    if (mounted) ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN berhasil diubah.')));
+    await PosDb.instance.setSetting('owner_pin_enabled', 'true');
+    if (mounted) {
+      setState(() => pinEnabled = true);
+      ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('PIN berhasil diubah.')));
+    }
   }
   Future<String?> _askPin(String title) async {
     final c = TextEditingController();
@@ -2497,22 +2820,32 @@ final result = await FilePicker.platform.pickFiles(
   }
   @override Widget build(BuildContext context) => ListView(padding: const EdgeInsets.all(16), children: [
       
-Card(
-  child: ListTile(
-    leading: const CircleAvatar(
-      child: Icon(Icons.notifications_active_outlined),
-    ),
-    title: const Text('Pengingat tutup toko'),
-    subtitle: const Text(
-      'Atur pesan, jam pengingat, dan suara notifikasi',
-    ),
-    trailing: const Icon(Icons.chevron_right),
-    onTap: configureClosingReminder,
-  ),
-),
+Card(child: Column(children: [
+      ListTile(
+        leading: const CircleAvatar(child: Icon(Icons.notifications_active_outlined)),
+        title: const Text('Pengingat tutup toko'),
+        subtitle: const Text('Atur pesan, jam pengingat, dan suara notifikasi'),
+        trailing: const Icon(Icons.chevron_right),
+        onTap: configureClosingReminder,
+      ),
+      SwitchListTile(
+        title: const Text('Aktifkan alarm harian'),
+        subtitle: Text(reminderEnabled ? 'Alarm harian aktif' : 'Alarm harian dimatikan'),
+        value: reminderEnabled,
+        onChanged: _toggleReminder,
+      ),
+    ])),
 
-    Card(child: ListTile(leading: const CircleAvatar(child: Icon(Icons.lock_outline)), title: const Text('PIN pemilik'),
-      subtitle: const Text('Atur atau ganti PIN untuk membuka informasi rahasia'), trailing: const Icon(Icons.chevron_right), onTap: changePin)),
+    Card(child: Column(children: [
+      ListTile(leading: const CircleAvatar(child: Icon(Icons.lock_outline)), title: const Text('PIN pemilik'),
+        subtitle: const Text('Atur atau ganti PIN untuk membuka informasi rahasia'), trailing: const Icon(Icons.chevron_right), onTap: changePin),
+      SwitchListTile(
+        title: const Text('Aktifkan PIN pemilik'),
+        subtitle: Text(pinEnabled ? 'Informasi rahasia dilindungi PIN' : 'PIN mati; informasi rahasia tidak dikunci'),
+        value: pinEnabled,
+        onChanged: _toggleOwnerPin,
+      ),
+    ])),
     Card(child: ListTile(leading: const CircleAvatar(child: Icon(Icons.cloud_upload_outlined)), title: const Text('Backup ke Google Drive'),
       subtitle: const Text('Cadangkan database secara manual melalui menu berbagi Android'), trailing: const Icon(Icons.chevron_right), onTap: backupNow)),
     Card(child: ListTile(leading: const CircleAvatar(child: Icon(Icons.cloud_download_outlined)), title: const Text('Restore dari backup'),
